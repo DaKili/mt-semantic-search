@@ -23,7 +23,6 @@ def load_modules():
     for file in json_files:
         with open(os.path.join("input", file), 'r', encoding='utf-8') as f:
             modules += json.load(f)
-    print(f"Loaded {len(modules)} total modules")
     return modules
 
 def create_module_text(module):
@@ -106,7 +105,6 @@ def main():
     
     similar = find_similar_modules(number, embeddings, modules)
     
-    # Print results
     print("\n=== Results ===")
     print(f"\nTop 5 modules similar to: {modules[number]['title']}\n")
     for result in similar[:5]:
