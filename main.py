@@ -1,21 +1,52 @@
+import weaviate
+import weaviate.classes as wvc
+from weaviate.classes.query import MetadataQuery
 import json
 import os
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
-import argparse
-from datetime import datetime
-import hashlib
 
-def get_cache_path(name):
-    cache_dir = 'cache'
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-    return os.path.join(cache_dir, name)
+col_name = "cit_modules"
 
-def get_data_hash(modules):
-    return hashlib.md5(json.dumps(modules, sort_keys=True).encode()).hexdigest()
+def create_schema(client: weaviate.WeaviateClient):
+    try:
+        try:
+            collection = client.collections.get(col_name)
+            if collection.query.fetch_objects(limit=1).objects:
+                print("skipping creation")
+                return collection
+            else:
+                print("recreating collection")
+                client.collections.delete(col_name)
+        except Exception as e:
+            print("Collection doesn't exist, creating new one")
+        
+        collection = client.collections.create(
+            name=col_name,
+            vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_transformers(),
+            properties=[
+                wvc.config.Property(
+                    name="module_id",
+                    data_type=wvc.config.DataType.TEXT,
+                ),
+                wvc.config.Property(
+                    name="title",
+                    data_type=wvc.config.DataType.TEXT,
+                ),
+                wvc.config.Property(
+                    name="content",
+                    data_type=wvc.config.DataType.TEXT,
+                ),
+                wvc.config.Property(
+                    name="learning_outcomes",
+                    data_type=wvc.config.DataType.TEXT,
+                )
+            ]
+        )
+        print(f"Created \"{col_name}\" collection")
+        return collection
+        
+    except Exception as e:
+        print(f"Error in create_schema: {e}")
+        raise
 
 def load_modules():
     modules = []
@@ -23,94 +54,60 @@ def load_modules():
     for file in json_files:
         with open(os.path.join("input", file), 'r', encoding='utf-8') as f:
             modules += json.load(f)
+    print(f"Loaded {len(modules)} total modules")
     return modules
 
-def create_module_text(module):
-    '''primitive semantic search without weights'''
-    return f"{module['title']} {module['content']} {module['learning_outcomes']}"
+def import_modules_to_weaviate(client: weaviate.WeaviateClient, modules):
+    collection = client.collections.get(col_name)
+    
+    existing = collection.query.fetch_objects(limit=1).objects
+    if existing:
+        print("skipping import")
+        return
+    
+    print(f"importing {len(modules)} modules")
+    with collection.batch.dynamic() as batch:
+        for module in modules:
+            batch.add_object(
+                properties={
+                    "module_id": module["module_id"],
+                    "title": module["title"],
+                    "content": module["content"],
+                    "learning_outcomes": module["learning_outcomes"]
+                }
+            )
 
-def load_or_compute_embeddings(modules, model_name, force_recompute=False):
-    cache_file = get_cache_path('embeddings.npz')
-    metadata_file = get_cache_path('metadata.json')
+def find_similar_modules(client: weaviate.WeaviateClient, module, limit=5):
+    collection = client.collections.get(col_name)
     
-    if not force_recompute and os.path.exists(cache_file) and os.path.exists(metadata_file):
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
-            
-        if (metadata['data_hash'] == get_data_hash(modules) and 
-            metadata['model_name'] == model_name):
-            data = np.load(cache_file)
-            return data['embeddings']
+    response = collection.query.near_text(
+        query=f"{module['module_id']}, {module['title']}, {module['content'], {module['learning_outcomes']}}",
+        limit=5,
+        return_metadata=MetadataQuery(distance=True),
+    )
     
-    print("Computing new embeddings...")
-    model = SentenceTransformer(model_name)
-    
-    texts = [create_module_text(module) for module in modules]
-    batch_size = 32
-    embeddings = []
-    
-    for i in tqdm(range(0, len(texts), batch_size), desc="Computing embeddings"):
-        batch_texts = texts[i:i + batch_size]
-        batch_embeddings = model.encode(batch_texts)
-        embeddings.extend(batch_embeddings)
-    
-    embeddings = np.array(embeddings)
-    
-    print("Saving embeddings to cache...")
-    np.savez_compressed(cache_file, embeddings=embeddings)
-    metadata = {
-        'data_hash': get_data_hash(modules),
-        'model_name': model_name,
-        'timestamp': datetime.now().isoformat(),
-        'num_modules': len(modules)
-    }
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    return embeddings
-
-def find_similar_modules(module_idx, embeddings, modules, threshold=0.6):
-    similarities = cosine_similarity([embeddings[module_idx]], embeddings)[0]
-    mask = (similarities >= threshold) & (np.arange(len(similarities)) != module_idx)
-    similar_indices = np.where(mask)[0]
-    
-    results = [
-        {
-            'module_id': modules[idx]['module_id'],
-            'title': modules[idx]['title'],
-            'similarity': similarities[idx]
-        }
-        for idx in similar_indices
-    ]
-    
-    results = sorted(results, key=lambda x: x['similarity'], reverse=True)
-    print(f"\nFound {len(results)} modules above similarity threshold of {threshold}")
-    return results
+    return response.objects
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--force-recompute', action='store_true', 
-                        help='Force recomputation of embeddings')
-    args = parser.parse_args()
+    try:
+        modules = load_modules()
+        client = weaviate.connect_to_local(port=5002)
+        create_schema(client)
+        import_modules_to_weaviate(client, modules)
+        
+        target_module = next(m for m in modules if m["title"].startswith("Parallel Programming"))
+        similar = find_similar_modules(client, target_module)
+        
+        print("\n=== Results ===")
+        print(f"\nTop 5 modules similar to: {target_module['title']}\n")
+        for result in similar:
+            print(result.properties['title'])
+            print("Distance: " + str(result.metadata.distance))
+            print("")
     
-    modules = load_modules()
-    print(f"\nTotal modules loaded: {len(modules)}")
-    
-    # MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
-    MODEL_NAME = 'sentence-transformers/all-mpnet-base-v2'
-    embeddings = load_or_compute_embeddings(modules, MODEL_NAME, args.force_recompute)
-    
-    number = next((i for i, module in enumerate(modules) 
-                    if module['title'].startswith("Parallel Programming")), 42)
-    
-    similar = find_similar_modules(number, embeddings, modules)
-    
-    print("\n=== Results ===")
-    print(f"\nTop 5 modules similar to: {modules[number]['title']}\n")
-    for result in similar[:5]:
-        print(f"Module: ({result['module_id']}) {result['title']}")
-        print(f"Similarity: {result['similarity']:.2f}\n")
-    
+    finally:
+        if 'client' in locals():
+            client.close()
 
 if __name__ == "__main__":
     main()
